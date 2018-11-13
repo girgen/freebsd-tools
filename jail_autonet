@@ -1,0 +1,191 @@
+#!/bin/sh
+
+#
+# jail_autonet - a jail precommand startscript that automatically creates
+# netgraph interfaces for a jail from configuration defined in jail.conf
+#
+# It expects a patched version of jail(8) with the -o switch added, that
+# prints all options for a jail. The patched jail command also allows
+# the configure parameter vnet.bridge, which is not used by the jail(8)
+# framework, only by this script, but it keeps the config nice and tidy
+# when all parameters are in one place and one format.
+#
+# To use this, set jail_command="/path/to/jail_autonet" in rc.conf
+# and it will start the required network interfaces before starting a jail,
+# and remove them after shutting down a jail.
+#
+# Example jail.conf settings:
+# ---------------------------
+# path = "/jails/$name";
+# exec.consolelog = "/var/log/console.$name";
+#
+# vnet = "new";
+# vnet.bridge=bge0, bge1;
+# mount.fstab="/etc/fstab.$name";
+#
+# host.hostname = "$name.example.org";
+# vnet.interface = ng0_$name, ng1_$name;
+#
+# # local jail, only attach to bge0
+# mylocaljail {
+#   vnet.interface=ng0_masterpp;
+#   vnet.bridge=bge1;
+# }
+#
+# # standard vanilla jail, use only defaults
+# mystandardjail {}
+# ---------------------------
+#
+# Known bugs: don't use jail_parallel_start, it might bite you here.
+#
+# Written by Palle Girgensohn <girgen@FreeBSD.org>
+# Bits and inspiration from the vimage project by zec (at) fer.hr
+#
+
+# calculate and set a MAC address for the interface
+# jail_ng_set_macaddr bridge interface linknum
+jail_ng_set_macaddr()
+{
+	# Set the MAC address of the new interface
+	# using a sensible algorithm to prevent
+	# conflicts on the network.
+	#
+	# MAC  LP:LL:LB:BB:BB:BB
+	# P    2, 6, A, or E but usually 2
+	# NOTE: Indicates "privately administered" MAC
+	# L    ng_bridge(4) link number (1-65535)
+	# B    Same as bridged interface
+	#
+	local _ether_devid _bridge _ng_eiface_name _n
+	_bridge=$1
+	_ng_eiface_name=$2
+	_n=$3
+
+	local m1=$(($_n >> 12))
+	local m2=$(($(($_n >> 4)) % 256 ))
+	local m3=$(($_n % 16))
+
+	_bridge_ether=$( ifconfig ${_bridge} ether | awk '/ether/{print $2}' )
+	_ether_devid=`printf "%01x2:%02x:%01x%s" $m1 $m2 $m3 "${_bridge_ether#??:??:?}"`
+
+	ifconfig ${_ng_eiface_name} ether "${_ether_devid}" > /dev/null 2>&1
+}
+
+# create netgraph interfaces for all listed interfaces that don't exist
+# and connect them to the correspondant (physical) bridge interface
+#
+# NOTE that the linknum stuff is hardly compatible with jail_parallel_start
+#
+jail_ng_autocreate ()
+{
+	local i j _jail _bridge _bridges _ng_eiface_name _interfaces
+
+	_jail=$1
+
+	/usr/sbin/jail -o $_jail | grep -q 'vnet=new' || return
+
+	_bridges=`/usr/sbin/jail -o $_jail | sed -e 's,.* vnet.bridge=\([^[:blank:]]*\).*,\1,; s/,/ /g'`
+	_interfaces=`/usr/sbin/jail -o $_jail | sed -e 's,.* vnet.interface=\([^[:blank:]]*\).*,\1,; s/,/ /g'`
+
+	i=0
+	for _interface in $_interfaces; do
+		j=0
+		for _bridge in $_bridges; do
+			[ $i = $j ] && break
+			j=$(($j + 1))
+		done
+
+		# make sure the interface has been bridged
+		if ! /usr/sbin/ngctl info ${_bridge}bridge: > /dev/null 2>&1; then
+			/usr/sbin/ngctl mkpeer ${_bridge}: bridge lower link0 || exit 1
+			/usr/sbin/ngctl connect ${_bridge}: ${_bridge}:lower upper link1 || exit 1
+			/usr/sbin/ngctl name ${_bridge}:lower ${_bridge}bridge || exit 1
+		fi
+
+		# Make sure the bridged-interface is active
+		ifconfig ${_bridge} up || exit 1
+
+		# Set promiscuous mode and
+		# don't overwrite src addr
+		/usr/sbin/ngctl msg ${_bridge}: setpromisc 1 || exit 1
+		/usr/sbin/ngctl msg ${_bridge}: setautosrc 0 || exit 1
+
+		# Add a new interface to the bridge
+		linknum=2
+		while /usr/sbin/ngctl msg ${_bridge}bridge: getstats ${linknum} > /dev/null 2>&1; do
+			linknum=$((${linknum} + 1))
+		done
+		/usr/sbin/ngctl mkpeer ${_bridge}:lower eiface link${linknum} ether || exit 1
+
+		# Rename the new interface, max 15 chars
+		while [ ${#_interface} -gt 15 ]; do
+			_interface="${_interface%?}"
+		done
+
+		_ngeth=$( set -- `/usr/sbin/ngctl show -n  ${_bridge}bridge:link${linknum}` && echo $2 ) || exit 1
+		/usr/sbin/ngctl name ${_bridge}bridge:link${linknum} ${_interface} || exit 1
+		ifconfig ${_ngeth} name ${_interface} || exit 1
+
+		jail_ng_set_macaddr ${_bridge} ${_interface} ${linknum}
+
+		i=$(($i + 1))
+	done
+}
+
+
+jail_ng_autoremove()
+{
+	# Disconnect ng_bridge(4) connections and shutdown
+	# ng_eiface(4) interface(s)
+	#
+	local i, _interface, _jail
+	_jail=$1
+
+	/usr/sbin/jail -o $_jail | grep -q 'vnet=new' || return
+
+	for _interface in `/usr/sbin/jail -o $_jail | sed -e 's,.* vnet.interface=\([^[:blank:]]*\).*,\1,; s/,/ /g'`; do
+		while [ ${#_interface} -gt 15 ]; do
+			_interface="${_interface%?}"
+		done
+		/usr/sbin/ngctl shutdown "${_interface}:" > /dev/null 2>&1
+	done
+}
+
+savedargs="$@"
+
+# we ignore most options, only create and remove are interesting
+OPTIND=1
+while getopts "cdf:hiJ:lmn:op:qrRs:u:U:v" i; do
+	case $i in
+		c)
+			mode=create
+			;;
+		r)
+			mode=remove
+			;;
+	esac
+done
+shift $((OPTIND - 1))
+jails="$@"
+
+if [ -z "$jails" ]; then
+	jails=`/usr/sbin/jail -o | /usr/bin/sed -e 's,.* name=\([^[:blank:]]*\).*,\1,'`
+fi
+
+if [ "$mode" = create ]; then
+	for _jail in $jails; do
+		jail_ng_autocreate $_jail
+	done
+	exec jail $savedargs
+fi
+
+if [ "$mode" = remove ]; then
+	/usr/sbin/jail $savedargs
+	rc=$?
+	for _jail in $jails; do
+		jail_ng_autoremove $_jail
+	done
+	exit $rc
+fi
+
+exec /usr/sbin/jail $savedargs
