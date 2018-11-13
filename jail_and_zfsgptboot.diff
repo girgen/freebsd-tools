@@ -1,0 +1,72 @@
+Index: usr.sbin/jail/config.c
+===================================================================
+--- usr.sbin/jail/config.c	(revision 337890)
++++ usr.sbin/jail/config.c	(working copy)
+@@ -90,6 +90,7 @@
+     [IP_MOUNT_FSTAB] =		{"mount.fstab",		PF_INTERNAL},
+     [IP_STOP_TIMEOUT] =		{"stop.timeout",	PF_INTERNAL | PF_INT},
+     [IP_VNET_INTERFACE] =	{"vnet.interface",	PF_INTERNAL},
++    [IP_VNET_BRIDGE] =		{"vnet.bridge",		PF_INTERNAL},
+ #ifdef INET
+     [IP__IP4_IFADDR] =		{"ip4.addr",	PF_INTERNAL | PF_CONV | PF_REV},
+ #endif
+Index: usr.sbin/jail/jail.c
+===================================================================
+--- usr.sbin/jail/jail.c	(revision 337890)
++++ usr.sbin/jail/jail.c	(working copy)
+@@ -151,7 +151,7 @@
+ 	cfname = CONF_FILE;
+ 	JidFile = NULL;
+ 
+-	while ((ch = getopt(argc, argv, "cdf:hiJ:lmn:p:qrRs:u:U:v")) != -1) {
++	while ((ch = getopt(argc, argv, "cdf:hiJ:lmn:op:qrRs:u:U:v")) != -1) {
+ 		switch (ch) {
+ 		case 'c':
+ 			op |= JF_START;
+@@ -186,6 +186,9 @@
+ 			add_param(NULL, NULL, KP_NAME, optarg);
+ 			docf = 0;
+ 			break;
++		case 'o':
++			op |= JF_BPARAM;
++			break;
+ 		case 'p':
+ 			paralimit = strtol(optarg, NULL, 10);
+ 			if (paralimit == 0)
+@@ -366,6 +369,14 @@
+ 	}
+ 	setlinebuf(stdout);
+ 
++	if (op & JF_BPARAM) {
++		while ((j = next_jail()))
++		{
++			print_jail(stdout, j, oldcl);
++		}
++		exit(0);
++	}
++
+ 	/*
+ 	 * The main loop: Get an available jail and perform the required
+ 	 * operation on it.  When that is done, the jail may be finished,
+Index: usr.sbin/jail/jailp.h
+===================================================================
+--- usr.sbin/jail/jailp.h	(revision 337890)
++++ usr.sbin/jail/jailp.h	(working copy)
+@@ -67,7 +67,9 @@
+ #define JF_TIMEOUT	0x0200	/* A command (or process kill) timed out */
+ #define JF_SLEEPQ	0x0400	/* Waiting on a command and/or timeout */
+ #define JF_FROM_RUNQ	0x0800	/* Has already been on the run queue */
++#define JF_BPARAM	0x1000  /* Just get the bridge parameter */
+ 
++
+ #define JF_OP_MASK		(JF_START | JF_SET | JF_STOP)
+ #define JF_RESTART		(JF_START | JF_STOP)
+ #define JF_START_SET		(JF_START | JF_SET)
+@@ -104,6 +106,7 @@
+ 	IP_MOUNT_FSTAB,		/* A standard fstab(5) file */
+ 	IP_STOP_TIMEOUT,	/* Time to wait after sending SIGTERM */
+ 	IP_VNET_INTERFACE,	/* Assign interface(s) to vnet jail */
++	IP_VNET_BRIDGE,		/* Assign bridge for each vnet interface */
+ #ifdef INET
+ 	IP__IP4_IFADDR,		/* Copy of ip4.addr with interface/netmask */
+ #endif
